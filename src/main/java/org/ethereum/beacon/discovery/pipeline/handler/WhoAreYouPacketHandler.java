@@ -26,6 +26,7 @@ import org.ethereum.beacon.discovery.schema.EnrField;
 import org.ethereum.beacon.discovery.schema.NodeRecord;
 import org.ethereum.beacon.discovery.schema.NodeSession;
 import org.ethereum.beacon.discovery.schema.NodeSession.SessionState;
+import org.ethereum.beacon.discovery.task.TaskStatus;
 import org.ethereum.beacon.discovery.type.Bytes12;
 import org.ethereum.beacon.discovery.type.Bytes16;
 import org.ethereum.beacon.discovery.util.Functions;
@@ -65,16 +66,22 @@ public class WhoAreYouPacketHandler extends AbstractSkippingEnvelopeHandler {
       final NodeRecord nodeRecord = session.getNodeRecord().orElseThrow();
 
       Bytes12 whoAreYouNonce = whoAreYouPacket.getHeader().getStaticHeader().getNonce();
-      boolean nonceMatches =
-          session.getLastOutboundNonce().map(whoAreYouNonce::equals).orElse(false);
-      if (!nonceMatches) {
+      // Per spec §"WHOAREYOU is only ever valid as a response to a previously sent request":
+      // accept iff the nonce is in our recent outbound window AND at least one request is still
+      // pending. The first check rejects unknown / evicted nonces. The second check rejects a
+      // stale or replayed WHOAREYOU whose referenced request has already been answered — without
+      // this, a delayed duplicate could overwrite live session keys on an established session.
+      final boolean recent = session.hasRecentOutboundNonce(whoAreYouNonce);
+      final boolean hasPendingRequests = session.getFirstPendingRequestInfo().isPresent();
+      if (!recent || !hasPendingRequests) {
         LOG.trace(
-            "Verification not passed for message [{}] from node {} in status {}",
+            "Ignoring WHOAREYOU [{}] from node {} (status {}): recent={}, hasPendingRequests={}",
             whoAreYouPacket,
             nodeRecord,
-            session.getState());
+            session.getState(),
+            recent,
+            hasPendingRequests);
         envelope.remove(Field.PACKET_WHOAREYOU);
-        session.cancelAllRequests("Bad WHOAREYOU received from node");
         return;
       }
       Bytes remotePubKey = (Bytes) nodeRecord.get(EnrField.PKEY_SECP256K1);
@@ -102,19 +109,27 @@ public class WhoAreYouPacketHandler extends AbstractSkippingEnvelopeHandler {
               ephemeralKeyPair.secretKey(),
               remotePubKey,
               challengeData);
+      final Optional<RequestInfo> embeddedRequestOpt = session.getFirstPendingRequestInfo();
+      if (embeddedRequestOpt.isEmpty()) {
+        // Race: the last pending request expired between the gate above and this lookup
+        // (session monitor is released between synchronized calls, and HKDF runs in between).
+        // Treat the same as a gate miss — ignore the WHOAREYOU rather than throwing into
+        // the catch path and calling cancelAllRequests for a benign race. Note: we have NOT
+        // yet applied hkdfKeys to the session, so the previous session keys remain valid.
+        LOG.trace(
+            "Ignoring WHOAREYOU [{}] from node {} (status {}): no pending request after race",
+            whoAreYouPacket,
+            nodeRecord,
+            session.getState());
+        envelope.remove(Field.PACKET_WHOAREYOU);
+        return;
+      }
+      final RequestInfo embeddedRequest = embeddedRequestOpt.get();
+      final V5Message message = embeddedRequest.getMessage();
+
+      // Past the race-check: we will emit a handshake, so it's safe to install the new keys.
       session.setInitiatorKey(hkdfKeys.getInitiatorKey());
       session.setRecipientKey(hkdfKeys.getRecipientKey());
-      final V5Message message =
-          session
-              .getFirstAwaitRequestInfo()
-              .or(session::getFirstSentRequestInfo)
-              .map(RequestInfo::getMessage)
-              .orElseThrow(
-                  () ->
-                      new RuntimeException(
-                          String.format(
-                              "Received WHOAREYOU in envelope #%s but no requests await in %s session",
-                              envelope.getIdString(), session)));
 
       Bytes ephemeralPubKey =
           Functions.deriveCompressedPublicKeyFromPrivate(ephemeralKeyPair.secretKey());
@@ -132,13 +147,14 @@ public class WhoAreYouPacketHandler extends AbstractSkippingEnvelopeHandler {
       Header<HandshakeAuthData> header =
           Header.createHandshakeHeader(
               session.getHomeNodeId(),
-              session.generateNonce(),
+              session.generateHandshakeNonce(),
               idSignature,
               ephemeralPubKey,
               Optional.ofNullable(respRecord));
       session.setState(SessionState.AUTHENTICATED);
 
       session.sendOutgoingHandshake(header, message);
+      embeddedRequest.setTaskStatus(TaskStatus.SENT);
 
       envelope.remove(Field.PACKET_WHOAREYOU);
       NextTaskHandler.tryToSendAwaitTaskIfAny(session, outgoingPipeline, scheduler);

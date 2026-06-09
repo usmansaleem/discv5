@@ -9,6 +9,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import com.google.common.annotations.VisibleForTesting;
 import java.net.InetSocketAddress;
 import java.security.SecureRandom;
+import java.util.Collection;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -128,8 +129,9 @@ public class NodeSessionManager extends AbstractSkippingEnvelopeHandler {
     if (removedSession != null) {
       // Mark inactive to prevent registering any new nonces
       removedSession.markInactive();
-      // And then clean up the last recorded nonce, if any
-      removedSession.getLastOutboundNonce().ifPresent(lastNonceToSession::remove);
+      // Clean up ALL nonce mappings for this session. Multiple nonces may be registered when
+      // several packets were sent before the handshake completed (see onSessionLastNonceUpdate).
+      lastNonceToSession.values().removeIf(s -> s == removedSession);
     }
   }
 
@@ -145,10 +147,34 @@ public class NodeSessionManager extends AbstractSkippingEnvelopeHandler {
     return Optional.ofNullable(lastNonceToSession.get(nonce));
   }
 
+  /**
+   * Mirrors {@link NodeSession}'s bounded recent-outbound-nonce window. The session passes the
+   * nonce evicted from its window (if any) so we can drop the matching {@code lastNonceToSession}
+   * entry at the same time. This keeps the map bounded at {@code num_sessions *
+   * MAX_RECENT_OUTBOUND_NONCES}.
+   */
   public void onSessionLastNonceUpdate(
-      final NodeSession session, final Optional<Bytes12> previousNonce, final Bytes12 newNonce) {
-    previousNonce.ifPresent(lastNonceToSession::remove);
+      final NodeSession session, final Optional<Bytes12> evictedNonce, final Bytes12 newNonce) {
+    // Value-conditional remove so a colliding nonce (or a delete-then-evict race with another
+    // session that has since reused the nonce) cannot evict the other session's fresh mapping.
+    // Mirrors removeNoncesForSession.
+    evictedNonce.ifPresent(n -> lastNonceToSession.remove(n, session));
     lastNonceToSession.put(newNonce, session);
+  }
+
+  /**
+   * Removes the given nonces from {@code lastNonceToSession} when they still map to {@code
+   * session}. Called by {@link NodeSession}'s handshake reset so the manager's view stays
+   * consistent with the session's bounded recent-nonce window even when the window is cleared en
+   * bloc (rather than via single-nonce eviction in {@link #onSessionLastNonceUpdate}).
+   *
+   * <p>Uses value-conditional removal so a race where the session was already replaced by a new one
+   * for the same nonce cannot remove the new mapping.
+   */
+  public void removeNoncesForSession(final NodeSession session, final Collection<Bytes12> nonces) {
+    for (Bytes12 nonce : nonces) {
+      lastNonceToSession.remove(nonce, session);
+    }
   }
 
   private NodeSession createNodeSession(

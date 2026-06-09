@@ -14,11 +14,11 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -63,6 +63,15 @@ public class NodeSession {
    */
   @VisibleForTesting static final int MAX_PENDING_WHOAREYOU = 5;
 
+  /**
+   * Maximum number of recent outbound nonces retained per session. A WHOAREYOU is accepted iff its
+   * nonce is one of the last {@code MAX_RECENT_OUTBOUND_NONCES} we sent — broader than just the
+   * latest (so concurrent ordinary packets work, and a resent WHOAREYOU referencing an earlier
+   * packet is still bindable), narrower than "any nonce we've ever sent" (no unbounded growth in
+   * {@code NodeSessionManager.lastNonceToSession}; stale post-auth WHOAREYOUs evict naturally).
+   */
+  @VisibleForTesting static final int MAX_RECENT_OUTBOUND_NONCES = 8;
+
   private final Bytes32 homeNodeId;
   private final LocalNodeRecordStore localNodeRecordStore;
   private final NodeSessionManager nodeSessionManager;
@@ -95,6 +104,11 @@ public class NodeSession {
           });
 
   private Optional<Bytes12> lastOutboundNonce = Optional.empty();
+
+  // Bounded set of recent outbound nonces in insertion order. Used by the initiator to validate
+  // incoming WHOAREYOU packets and by NodeSessionManager to bind WHOAREYOU → session. Capped at
+  // MAX_RECENT_OUTBOUND_NONCES so memory does not grow with session lifetime.
+  private final LinkedHashSet<Bytes12> recentOutboundNonces = new LinkedHashSet<>();
   private boolean active = true;
   private final Function<Random, Bytes12> nonceGenerator;
 
@@ -120,7 +134,12 @@ public class NodeSession {
         outgoingPipeline,
         rnd,
         requestExpirationScheduler,
-        new ConcurrentHashMap<>());
+        // Insertion-ordered so getFirstAwait/SentRequestInfo() returns the earliest-created
+        // (≈ earliest-sent) request — the one a WHOAREYOU nonce-referenced (spec §189-201).
+        // ConcurrentHashMap iterates in hash-bucket order, which would pick a non-deterministic
+        // request to embed in the handshake. Synchronization is provided by NodeSession's
+        // synchronized methods (all access goes through them).
+        Collections.synchronizedMap(new LinkedHashMap<>()));
   }
 
   @VisibleForTesting
@@ -211,6 +230,31 @@ public class NodeSession {
   }
 
   /**
+   * Resends the first pending WHOAREYOU challenge when a second ordinary packet arrives while a
+   * handshake is already in progress. Mirrors geth's handleUnknown which always resends the current
+   * challenge rather than issuing a fresh one with a different nonce.
+   *
+   * <p>Reads the entry via the values iterator rather than {@code get(nonce)} because {@link
+   * #pendingWhoAreYou} is a {@link LinkedHashMap} with {@code accessOrder=true} — using {@code get}
+   * would move the accessed entry to the tail, causing a subsequent call to pick a different
+   * "first" entry when multiple pending challenges exist.
+   */
+  public void resendFirstOutgoingWhoAreYou() {
+    final PendingWhoAreYou pending;
+    synchronized (pendingWhoAreYou) {
+      if (pendingWhoAreYou.isEmpty()) {
+        return;
+      }
+      pending = pendingWhoAreYou.values().iterator().next();
+    }
+    LOG.trace(
+        () ->
+            String.format(
+                "Resending outgoing WhoAreYou message %s in session %s", pending.packet(), this));
+    sendOutgoing(pending.maskingIV(), pending.packet());
+  }
+
+  /**
    * Returns the challenge data ({@code maskingIV || header bytes}) for every pending WHOAREYOU. The
    * handshake handler attempts to match the incoming handshake against each candidate because the
    * handshake packet does not directly identify which challenge it answers.
@@ -278,7 +322,11 @@ public class NodeSession {
                   String.format(
                       "Request %s expired for id %s in session %s: no reply",
                       requestInfo, wrappedId, this));
-          requestIdStatuses.remove(wrappedId);
+          // Route through the synchronized helper so the removal serialises with iterations
+          // in getFirstAwait/SentRequestInfo() and cancelAllRequests(). The underlying
+          // synchronizedMap(LinkedHashMap) throws CME on concurrent structural modification
+          // during iteration.
+          clearRequestInfo(wrappedId);
           resetHandshakeState();
         });
     return requestInfo;
@@ -287,6 +335,15 @@ public class NodeSession {
   private synchronized void resetHandshakeState() {
     if (state == SessionState.WHOAREYOU_SENT || state == SessionState.RANDOM_PACKET_SENT) {
       pendingWhoAreYou.clear();
+      if (!recentOutboundNonces.isEmpty()) {
+        // Snapshot before clearing so the manager iterates a stable collection. The live set is
+        // cleared immediately after; passing it directly would hand the manager a reference that
+        // becomes empty before it finishes iterating (in tests) or is unexpectedly mutated.
+        // Route bulk eviction through the manager so lastNonceToSession stays in sync with the
+        // bounded window. Without this, orphaned mappings would linger until session delete.
+        nodeSessionManager.removeNoncesForSession(this, Set.copyOf(recentOutboundNonces));
+        recentOutboundNonces.clear();
+      }
       setState(SessionState.INITIAL);
     }
   }
@@ -319,15 +376,34 @@ public class NodeSession {
   /** Generates random nonce */
   public synchronized Bytes12 generateNonce() {
     final Bytes12 newNonce = nonceGenerator.apply(rnd);
-    final Optional<Bytes12> oldNonce = lastOutboundNonce;
     lastOutboundNonce = Optional.of(newNonce);
+    recentOutboundNonces.add(newNonce);
+    Optional<Bytes12> evicted = Optional.empty();
+    if (recentOutboundNonces.size() > MAX_RECENT_OUTBOUND_NONCES) {
+      final Bytes12 eldest = recentOutboundNonces.iterator().next();
+      recentOutboundNonces.remove(eldest);
+      evicted = Optional.of(eldest);
+    }
     if (active) {
-      // Update while synchronized to ensure only one update in flight at a time. Otherwise the
-      // previous nonce may not have been recorded before we try to remove it leading to a memory
-      // leak. Also only records the session if it's active to avoid re-adding a removed session
-      nodeSessionManager.onSessionLastNonceUpdate(this, oldNonce, newNonce);
+      // Update while synchronized so the manager's map stays consistent with the session's
+      // bounded window. Skip when the session is inactive to avoid re-adding a removed session.
+      nodeSessionManager.onSessionLastNonceUpdate(this, evicted, newNonce);
     }
     return newNonce;
+  }
+
+  /**
+   * Generates a nonce for a <em>handshake</em> packet. Unlike {@link #generateNonce()}, this nonce
+   * is not tracked in the recent-outbound window because WHOAREYOU packets never reference
+   * handshake-packet nonces; tracking them would wastefully evict ordinary-packet nonces from the
+   * bounded window.
+   */
+  public synchronized Bytes12 generateHandshakeNonce() {
+    return nonceGenerator.apply(rnd);
+  }
+
+  public synchronized boolean hasRecentOutboundNonce(final Bytes12 nonce) {
+    return recentOutboundNonces.contains(nonce);
   }
 
   public synchronized Optional<Bytes12> getLastOutboundNonce() {
@@ -398,8 +474,10 @@ public class NodeSession {
   }
 
   public synchronized Optional<RequestInfo> getRequestInfo(final Bytes requestId) {
-    final RequestInfo requestInfo = requestIdStatuses.get(requestId);
-    return requestId == null ? Optional.empty() : Optional.of(requestInfo);
+    if (requestId == null) {
+      return Optional.empty();
+    }
+    return Optional.ofNullable(requestIdStatuses.get(requestId));
   }
 
   /**
@@ -416,6 +494,11 @@ public class NodeSession {
     return requestIdStatuses.values().stream()
         .filter(requestInfo -> SENT.equals(requestInfo.getTaskStatus()))
         .findFirst();
+  }
+
+  /** Returns the first request eligible for handshake embedding (AWAIT preferred over SENT). */
+  public synchronized Optional<RequestInfo> getFirstPendingRequestInfo() {
+    return getFirstAwaitRequestInfo().or(this::getFirstSentRequestInfo);
   }
 
   public Stream<NodeRecord> getNodeRecordsInBucket(final int distance) {
